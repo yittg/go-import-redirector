@@ -67,19 +67,50 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 
+	"github.com/BurntSushi/toml"
 	"golang.org/x/crypto/acme/autocert"
 )
+
+type Config struct {
+	Modules []ModConfig
+}
+
+type ModConfig struct {
+	ImportPath string
+	RepoPath   string
+}
+
+type mod struct {
+	importPath string
+	repoPath   string
+	wildcard   bool
+}
+
+type modSlice []mod
+
+func (ms modSlice) Len() int {
+	return len(ms)
+}
+
+func (ms modSlice) Less(i, j int) bool {
+	return ms[i].importPath > ms[j].importPath
+}
+
+func (ms modSlice) Swap(i, j int) {
+	ms[i], ms[j] = ms[j], ms[i]
+}
 
 var (
 	addr             = flag.String("addr", ":http", "serve http on `address`")
 	serveTLS         = flag.Bool("tls", false, "serve https on :443")
 	vcs              = flag.String("vcs", "git", "set version control `system`")
 	letsEncryptEmail = flag.String("letsencrypt", "", "use lets encrypt to issue TLS certificate, agreeing to TOS as `email` (implies -tls)")
-	importPath       string
-	repoPath         string
-	wildcard         bool
+	configFile       = flag.String("config", "", "configuration file")
+	mods             = modSlice{}
+	hosts            = map[string]struct{}{}
 )
 
 func usage() {
@@ -97,11 +128,45 @@ func main() {
 	log.SetPrefix("go-import-redirector: ")
 	flag.Usage = usage
 	flag.Parse()
-	if flag.NArg() != 2 {
+
+	if flag.NArg()%2 != 0 {
 		flag.Usage()
 	}
-	importPath = flag.Arg(0)
-	repoPath = flag.Arg(1)
+	for idx := 0; idx < flag.NArg(); idx += 2 {
+		importPath := flag.Arg(idx)
+		repoPath := flag.Arg(idx + 1)
+		parseModulePairAndRegister(importPath, repoPath, *serveTLS)
+	}
+
+	cfg := Config{}
+	if *configFile != "" {
+		if _, err := toml.DecodeFile(*configFile, &cfg); err != nil {
+			log.Fatalf("Failed to parse config file, %s", err)
+		}
+		for _, mod := range cfg.Modules {
+			parseModulePairAndRegister(mod.ImportPath, mod.RepoPath, *serveTLS)
+		}
+	}
+
+	if len(mods) == 0 {
+		flag.Usage()
+	}
+	sort.Sort(mods)
+
+	if !*serveTLS {
+		log.Fatal(http.ListenAndServe(*addr, nil))
+	}
+
+	var uniqHosts []string
+	for host := range hosts {
+		uniqHosts = append(uniqHosts, host)
+	}
+	log.Fatal(http.Serve(autocert.NewListener(uniqHosts...), nil))
+}
+
+func parseModulePairAndRegister(importPath, repoPath string, parseHost bool) {
+	wildcard := false
+
 	if !strings.Contains(repoPath, "://") {
 		log.Fatal("repo path must be full URL")
 	}
@@ -113,18 +178,21 @@ func main() {
 		importPath = strings.TrimSuffix(importPath, "/*")
 		repoPath = strings.TrimSuffix(repoPath, "/*")
 	}
+	mods = append(mods, mod{
+		importPath: importPath,
+		repoPath:   repoPath,
+		wildcard:   wildcard,
+	})
 	http.HandleFunc(strings.TrimSuffix(importPath, "/")+"/", redirect)
 	http.HandleFunc(importPath+"/.ping", pong) // non-redirecting URL for debugging TLS certificates
-	if !*serveTLS {
-		log.Fatal(http.ListenAndServe(*addr, nil))
+	if !parseHost {
+		return
 	}
-
 	host := importPath
 	if i := strings.Index(host, "/"); i >= 0 {
 		host = host[:i]
 	}
-
-	log.Fatal(http.Serve(autocert.NewListener(host), nil))
+	hosts[host] = struct{}{}
 }
 
 var tmpl = template.Must(template.New("main").Parse(`<!DOCTYPE html>
@@ -149,36 +217,17 @@ type data struct {
 
 func redirect(w http.ResponseWriter, req *http.Request) {
 	path := strings.TrimSuffix(req.Host+req.URL.Path, "/")
-	var importRoot, repoRoot, suffix string
-	if wildcard {
-		if path == importPath {
-			http.Redirect(w, req, "https://godoc.org/"+importPath, 302)
-			return
-		}
-		if !strings.HasPrefix(path, importPath+"/") {
-			http.NotFound(w, req)
-			return
-		}
-		elem := path[len(importPath)+1:]
-		if i := strings.Index(elem, "/"); i >= 0 {
-			elem, suffix = elem[:i], elem[i:]
-		}
-		importRoot = importPath + "/" + elem
-		repoRoot = repoPath + "/" + elem
-	} else {
-		if path != importPath && !strings.HasPrefix(path, importPath+"/") {
-			http.NotFound(w, req)
-			return
-		}
-		importRoot = importPath
-		repoRoot = repoPath
-		suffix = path[len(importPath):]
-	}
 	d := &data{
-		ImportRoot: importRoot,
-		VCS:        *vcs,
-		VCSRoot:    repoRoot,
-		Suffix:     suffix,
+		VCS: *vcs,
+	}
+	for _, m := range mods {
+		if m.redirect(path, d) {
+			break
+		}
+	}
+	if d.ImportRoot == "" {
+		http.NotFound(w, req)
+		return
 	}
 	var buf bytes.Buffer
 	err := tmpl.Execute(&buf, d)
@@ -187,6 +236,28 @@ func redirect(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	w.Write(buf.Bytes())
+}
+
+func (m *mod) redirect(path string, d *data) bool {
+	if path != m.importPath && !strings.HasPrefix(path, m.importPath+"/") {
+		return false
+	}
+	if m.wildcard {
+		if path == m.importPath {
+			return false
+		}
+		elem := path[len(m.importPath)+1:]
+		if i := strings.Index(elem, "/"); i >= 0 {
+			elem, d.Suffix = elem[:i], elem[i:]
+		}
+		d.ImportRoot = m.importPath + "/" + elem
+		d.VCSRoot = m.repoPath + "/" + elem
+	} else {
+		d.ImportRoot = m.importPath
+		d.VCSRoot = m.repoPath
+		d.Suffix = path[len(m.importPath):]
+	}
+	return true
 }
 
 func pong(w http.ResponseWriter, req *http.Request) {
